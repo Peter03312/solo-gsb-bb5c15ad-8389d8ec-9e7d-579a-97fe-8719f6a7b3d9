@@ -201,6 +201,47 @@ class TripCreateIn(BaseModel):
     stops: list[TripStopIn] = Field(min_length=2, max_length=5)
 
 
+class TripPlanStopIn(BaseModel):
+    """One stop of a read-only trip plan: the point and its stay length."""
+
+    point_id: int = Field(ge=1)
+    duration_minutes: int = Field(
+        ge=1,
+        description=(
+            "Minutes spent at this stop; bounded by the existing per-stop "
+            "reservation duration limit."
+        ),
+    )
+
+
+class TripPlanIn(BaseModel):
+    """Read-only itinerary search (行程规划): 2..5 distinct points in order.
+
+    The service answers the earliest feasible complete itinerary inside the
+    (timezone-aware) search window without creating any reservation or
+    placeholder; an empty ``stops`` array means no feasible itinerary exists.
+    """
+
+    stops: list[TripPlanStopIn] = Field(min_length=2, max_length=5)
+    min_gap_minutes: int = Field(
+        default=0,
+        ge=0,
+        description="Minimum non-negative gap between two consecutive stops (end to start).",
+    )
+    search_from: datetime
+    search_to: datetime
+
+    @field_validator("search_from", "search_to")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-02T00:00:00+08:00)"
+            )
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -473,3 +514,27 @@ class TripOut(BaseModel):
     idempotency_key: str
     created_at: datetime
     stops: list[TripStopOut]
+
+
+class TripPlanStopOut(BaseModel):
+    """One located stop of a planned itinerary: UTC window + rule version."""
+
+    point_id: int
+    start: str
+    end: str
+    duration_minutes: int
+    rules_version: int
+
+
+class TripPlanOut(BaseModel):
+    """Result of a read-only trip plan (行程规划搜索).
+
+    ``stops`` is empty when no complete feasible itinerary exists in the
+    search window; nothing is booked by a plan, and later booking may still
+    fail because capacity or published rules have changed.
+    """
+
+    search_from: str
+    search_to: str
+    min_gap_minutes: int
+    stops: list[TripPlanStopOut]

@@ -300,6 +300,30 @@ def get_latest_payload(cur: psycopg.Cursor, point_id: int) -> dict | None:
     ).fetchone()
 
 
+def get_active_reservation_windows(
+    cur: psycopg.Cursor,
+    point_id: int,
+    window_from: datetime,
+    window_to: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """``(start_utc, end_utc)`` of active reservations overlapping a window.
+
+    Mirrors :func:`find_overlapping`'s strict half-open inequalities (visits
+    that merely touch the window edges never constrain it), but returns all
+    rows — the planner needs every boundary inside the span to reconstruct
+    the capacity-full intervals itself.
+    """
+    return [
+        (row["start_utc"], row["end_utc"])
+        for row in cur.execute(
+            "SELECT start_utc, end_utc FROM reservations "
+            "WHERE point_id = %s AND status = 'active' "
+            "AND start_utc < %s AND end_utc > %s ORDER BY start_utc, end_utc",
+            (point_id, window_to, window_from),
+        ).fetchall()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Reservations
 # ---------------------------------------------------------------------------

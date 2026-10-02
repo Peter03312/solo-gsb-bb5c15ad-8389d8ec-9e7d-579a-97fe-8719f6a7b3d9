@@ -549,3 +549,61 @@ echo
 echo "-- cancel one stop with its own token (200); the group replay still works --"
 api POST "/points/$APID/reservations/$TRIP_RID/cancel" "{\"cancel_token\":\"$TRIP_TOKEN\"}"
 api POST /trips "$TRIP_BODY"
+
+echo
+echo "== 11. Trip planning (行程规划搜索): read-only earliest itinerary =="
+# Points A and B above already hold a booked trip (A 09:00-09:30, B 10:00-10:30).
+# Ask for the earliest two-stop plan: 30 and 45 minutes on site, 15 minutes
+# apart, within a <= 7-day timezone-aware search window. The search books
+# nothing and dodges the already-booked capacity.
+D7="$(date -u -d '+7 day' +%F 2>/dev/null || date -u -v+7d +%F)"
+D8="$(date -u -d '+8 day' +%F 2>/dev/null || date -u -v+8d +%F)"
+api POST /trips/plan "{
+  \"stops\": [
+    {\"point_id\": $APID, \"duration_minutes\": 30},
+    {\"point_id\": $BPID, \"duration_minutes\": 45}
+  ],
+  \"min_gap_minutes\": 15,
+  \"search_from\": \"${D1}T00:00:00Z\",
+  \"search_to\": \"${D8}T00:00:00Z\"
+}"
+# -> 200: stops[] lexicographically earliest by each stop start, each with
+#    UTC start/end, duration_minutes and the rules_version it was based on.
+#    A is full on [09:00,09:30); the plan starts A at 08:00 (capacity 1).
+#    No feasible group would return 200 with an empty stops array.
+
+echo
+echo "-- search span over 7 days (422 invalid_period) --"
+api POST /trips/plan "{
+  \"stops\": [
+    {\"point_id\": $APID, \"duration_minutes\": 30},
+    {\"point_id\": $BPID, \"duration_minutes\": 45}
+  ],
+  \"min_gap_minutes\": 15,
+  \"search_from\": \"${D1}T00:00:00Z\",
+  \"search_to\": \"${D8}T00:00:01Z\"
+}"
+
+echo
+echo "-- unknown point named with stop_index (404 point_not_found) --"
+api POST /trips/plan "{
+  \"stops\": [
+    {\"point_id\": $APID, \"duration_minutes\": 30},
+    {\"point_id\": 999999, \"duration_minutes\": 45}
+  ],
+  \"min_gap_minutes\": 0,
+  \"search_from\": \"${D1}T00:00:00Z\",
+  \"search_to\": \"${D8}T00:00:00Z\"
+}"
+
+echo
+echo "-- repeated point (422 invalid_request); negative gap likewise --"
+api POST /trips/plan "{
+  \"stops\": [
+    {\"point_id\": $APID, \"duration_minutes\": 30},
+    {\"point_id\": $APID, \"duration_minutes\": 30}
+  ],
+  \"min_gap_minutes\": 0,
+  \"search_from\": \"${D1}T00:00:00Z\",
+  \"search_to\": \"${D8}T00:00:00Z\"
+}"

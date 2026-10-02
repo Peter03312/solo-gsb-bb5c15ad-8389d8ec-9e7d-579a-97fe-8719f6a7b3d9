@@ -569,6 +569,66 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
+    # Trip planning (行程规划搜索): read-only earliest itinerary.
+    # Give 2..5 distinct points in visit order, each stop's stay in minutes,
+    # a non-negative minimum gap and timezone-aware search bounds (<= 7 days).
+    # Nothing is booked: the answer carries UTC windows + rules versions, and
+    # an empty stops array means "no feasible complete itinerary".
+    # ------------------------------------------------------------------
+    in_eight = (
+        datetime.now(timezone.utc) + timedelta(days=8)
+    ).date().isoformat()
+    plan_body = {
+        "stops": [
+            {"point_id": qpid, "duration_minutes": 30},
+            {"point_id": rpid, "duration_minutes": 45},
+        ],
+        "min_gap_minutes": 15,
+        "search_from": f"{tomorrow}T00:00:00Z",
+        "search_to": f"{in_eight}T00:00:00Z",
+    }
+    status, plan = call("POST", "/trips/plan", plan_body)
+    show(
+        "read-only earliest itinerary (200; UTC windows + rules versions)",
+        status,
+        plan,
+    )
+
+    status, too_wide = call(
+        "POST",
+        "/trips/plan",
+        {
+            "stops": [
+                {"point_id": qpid, "duration_minutes": 30},
+                {"point_id": rpid, "duration_minutes": 45},
+            ],
+            "min_gap_minutes": 15,
+            "search_from": f"{tomorrow}T00:00:00Z",
+            "search_to": f"{in_eight}T00:00:01Z",
+        },
+    )
+    show("a search span over 7 days is rejected (422 invalid_period)", status, too_wide)
+
+    status, missing = call(
+        "POST",
+        "/trips/plan",
+        {
+            "stops": [
+                {"point_id": qpid, "duration_minutes": 30},
+                {"point_id": 999999, "duration_minutes": 45},
+            ],
+            "min_gap_minutes": 0,
+            "search_from": f"{tomorrow}T00:00:00Z",
+            "search_to": f"{in_eight}T00:00:00Z",
+        },
+    )
+    show("an unknown stop names stop_index/point_id (404)", status, missing)
+
+    # The planned windows can be fed straight back into POST /trips (end =
+    # start + duration_minutes); booking may still fail if capacity changed
+    # in the meantime — the plan reserves nothing.
+
+    # ------------------------------------------------------------------
     # Capacity (同时接待名额): 1..20 concurrent slots per point, default 1.
     # Booking/reschedule/reassign/trips/waitlist promotions all share the
     # half-open [start, end) concurrency rule; capacity increases sweep the
