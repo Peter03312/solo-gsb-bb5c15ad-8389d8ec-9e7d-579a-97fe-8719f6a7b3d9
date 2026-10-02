@@ -201,6 +201,48 @@ class TripCreateIn(BaseModel):
     stops: list[TripStopIn] = Field(min_length=2, max_length=5)
 
 
+class TripSearchStopIn(BaseModel):
+    """One stop of a trip availability search: a point and a stay length.
+
+    ``duration_minutes`` must be a positive number of minutes not exceeding
+    the existing per-reservation duration limit; the endpoint enforces that
+    range itself so an out-of-range duration reports ``invalid_period`` with
+    the offending ``stop_index`` rather than a generic 422.
+    """
+
+    point_id: int = Field(ge=1)
+    duration_minutes: int = Field(ge=1)
+
+
+class TripSearchIn(BaseModel):
+    """Read-only earliest-itinerary search (行程可行性搜索).
+
+    No reservation or placeholder is created.  ``stops`` lists 2..5 distinct
+    recycling points in visit order; ``min_gap_minutes`` is the minimum
+    separation between adjacent stops (0 allows touching); ``search_start`` /
+    ``search_end`` are timezone-aware instants bracketing the whole itinerary.
+    """
+
+    stops: list[TripSearchStopIn] = Field(min_length=2, max_length=5)
+    min_gap_minutes: int = Field(
+        default=0,
+        ge=0,
+        description="Minimum minutes between one stop's end and the next stop's start.",
+    )
+    search_start: datetime
+    search_end: datetime
+
+    @field_validator("search_start", "search_end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T00:00:00Z)"
+            )
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -473,3 +515,31 @@ class TripOut(BaseModel):
     idempotency_key: str
     created_at: datetime
     stops: list[TripStopOut]
+
+
+class TripSearchStopOut(BaseModel):
+    """One planned stop of the earliest feasible itinerary (UTC window)."""
+
+    point_id: int
+    start: str
+    end: str
+    rules_version: int
+
+
+class TripSearchOut(BaseModel):
+    """Result of a read-only trip availability search (行程可行性搜索).
+
+    ``trip`` is the lexicographically earliest feasible itinerary — stops
+    compared by start instant in visit order — or ``None`` when the snapshot
+    admits none.  Nothing is booked; the result is a snapshot and does not
+    guarantee capacity is still available if the itinerary is submitted
+    afterwards.  ``min_gap_minutes`` and the effective bounds (intersected
+    with the existing bookable lead-time limits) are echoed back.
+    """
+
+    trip: list[TripSearchStopOut] | None
+    min_gap_minutes: int
+    search_start: str
+    search_end: str
+    horizon_start: str
+    horizon_end: str

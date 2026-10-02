@@ -549,3 +549,94 @@ echo
 echo "-- cancel one stop with its own token (200); the group replay still works --"
 api POST "/points/$APID/reservations/$TRIP_RID/cancel" "{\"cancel_token\":\"$TRIP_TOKEN\"}"
 api POST /trips "$TRIP_BODY"
+
+echo
+echo "== 11. Trip availability search (行程可行性搜索): earliest plan, books nothing =="
+# Two fresh points, open 08:00-18:00 tomorrow (UTC).
+SAPOINT_JSON="$(api POST /points '{"name":"行程搜索点A","timezone":"UTC"}')"
+SAPID="$(echo "$SAPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$SAPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"18:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+SBPOINT_JSON="$(api POST /points '{"name":"行程搜索点B","timezone":"UTC"}')"
+SBPID="$(echo "$SBPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$SBPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"09:00\", \"end_time\": \"17:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- earliest feasible itinerary: 45 min at A, 30 min at B, >=30 min gap (200) --"
+SEARCH_BODY="{
+  \"stops\": [
+    {\"point_id\": $SAPID, \"duration_minutes\": 45},
+    {\"point_id\": $SBPID, \"duration_minutes\": 30}
+  ],
+  \"min_gap_minutes\": 30,
+  \"search_start\": \"${D1}T00:00:00Z\",
+  \"search_end\": \"${D1}T23:59:00Z\"
+}"
+SEARCH_JSON="$(api POST /trips/search "$SEARCH_BODY")"
+echo "$SEARCH_JSON"
+# -> trip[0]: 08:00-08:45 at A; trip[1]: 09:15-09:45 at B; nothing is booked.
+
+echo
+echo "-- searching again returns the same plan (read-only; no capacity consumed) --"
+api POST /trips/search "$SEARCH_BODY"
+
+echo
+echo "-- search span longer than 7 days -> 422 invalid_period --"
+D9="$(date -u -d "$D1 +8 day" +%F 2>/dev/null || date -u -j -v+8d -f '%F' "$D1" +%F)"
+api POST /trips/search "{
+  \"stops\": [
+    {\"point_id\": $SAPID, \"duration_minutes\": 30},
+    {\"point_id\": $SBPID, \"duration_minutes\": 30}
+  ],
+  \"search_start\": \"${D1}T00:00:00Z\",
+  \"search_end\": \"${D9}T00:00:00Z\"
+}"
+
+echo
+echo "-- over-long stay names the offending stop (422 invalid_period, stop_index 1) --"
+api POST /trips/search "{
+  \"stops\": [
+    {\"point_id\": $SAPID, \"duration_minutes\": 30},
+    {\"point_id\": $SBPID, \"duration_minutes\": 121}
+  ],
+  \"search_start\": \"${D1}T00:00:00Z\",
+  \"search_end\": \"${D1}T23:59:00Z\"
+}"
+
+echo
+echo "-- missing point names the failing stop (404 point_not_found, stop_index 1) --"
+api POST /trips/search "{
+  \"stops\": [
+    {\"point_id\": $SAPID, \"duration_minutes\": 30},
+    {\"point_id\": 999999, \"duration_minutes\": 30}
+  ],
+  \"search_start\": \"${D1}T00:00:00Z\",
+  \"search_end\": \"${D1}T23:59:00Z\"
+}"
+
+echo
+echo "-- the planned windows book successfully via POST /trips (201) --"
+api POST /trips "$(echo "$SEARCH_JSON" | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+print(json.dumps({
+  "idempotency_key": "search-then-book-demo",
+  "stops": [
+    {"point_id": s["point_id"], "start": s["start"], "end": s["end"]}
+    for s in body["trip"]
+  ],
+}))
+')"

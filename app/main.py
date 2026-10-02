@@ -46,6 +46,9 @@ from .schemas import (
     ReservationStateOut,
     TripCreateIn,
     TripOut,
+    TripSearchIn,
+    TripSearchOut,
+    TripSearchStopOut,
     TripStopOut,
     VersionOut,
     VersionSummaryOut,
@@ -59,6 +62,7 @@ from .schemas import (
 )
 from .scheduler import build_calendar, build_open_intervals, get_zone
 from .db import payload_to_ruleset
+from .trip_planner import StopPlanInput, plan_earliest_trip
 
 
 @asynccontextmanager
@@ -1311,3 +1315,179 @@ def create_trip(body: TripCreateIn, response: Response) -> TripOut:
                     )
                 )
             return _trip_out(trip, stops_out)
+
+
+# ---------------------------------------------------------------------------
+# Trip availability search (行程可行性搜索) — read-only earliest itinerary
+# ---------------------------------------------------------------------------
+
+@app.post("/trips/search", response_model=TripSearchOut, tags=["trips"])
+def search_trip(body: TripSearchIn) -> TripSearchOut:
+    """Find the earliest feasible 2..5-stop itinerary without booking it.
+
+    The whole query runs against one repeatable-read database snapshot and
+    creates no reservation or placeholder.  Structural parameter errors
+    (inverted search range, span over the limit, a non-positive/over-long
+    stay, a negative gap, a repeated point) are rejected with the existing
+    distinguishable codes and name the offending stop; a missing point or an
+    unpublished rule set is reported per stop exactly like trip booking
+    (``stop_index`` + ``point_id``).  When the snapshot simply admits no
+    itinerary, the response carries ``"trip": null``.
+    """
+    search_start = body.search_start.astimezone(timezone.utc)
+    search_end = body.search_end.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    max_duration = timedelta(
+        minutes=settings.reservation_max_duration_minutes
+    )
+    horizon_end = now + timedelta(days=settings.reservation_max_days_ahead)
+
+    # -- Structural / parameter validation (before any database access) ------
+    if search_end <= search_start:
+        raise InvalidPeriodError(
+            "search_end must be strictly after search_start",
+            details={
+                "search_start": utc_iso(search_start),
+                "search_end": utc_iso(search_end),
+            },
+        )
+    span_days = (search_end - search_start).total_seconds() / 86400
+    if span_days > settings.trip_search_max_days:
+        raise InvalidPeriodError(
+            f"search range spans {span_days:g} days; maximum allowed is "
+            f"{settings.trip_search_max_days} days",
+            details={
+                "max_search_days": settings.trip_search_max_days,
+                "span_days": span_days,
+            },
+        )
+
+    # Distinct points in one itinerary (same structural rule as trip booking).
+    index_by_point: dict[int, int] = {}
+    for index, stop in enumerate(body.stops):
+        first = index_by_point.get(stop.point_id)
+        if first is not None:
+            raise InvalidRequestError(
+                f"recycling point {stop.point_id} appears more than once in "
+                f"one search (stops {first} and {index}); each stop must visit "
+                f"a different point",
+                details={
+                    "point_id": stop.point_id,
+                    "stop_indexes": [first, index],
+                },
+            )
+        index_by_point[stop.point_id] = index
+
+    # Every stop's stay must obey the existing reservation duration cap
+    # (positive length is guaranteed by the schema); report the offending
+    # stop explicitly.
+    durations: list[timedelta] = []
+    for index, stop in enumerate(body.stops):
+        duration = timedelta(minutes=stop.duration_minutes)
+        if duration > max_duration:
+            raise InvalidPeriodError(
+                f"stop {index} lasts {stop.duration_minutes} minutes; the "
+                f"reservation duration limit is "
+                f"{settings.reservation_max_duration_minutes} minutes",
+                details={
+                    "stop_index": index,
+                    "point_id": stop.point_id,
+                    "max_duration_minutes":
+                        settings.reservation_max_duration_minutes,
+                    "duration_minutes": stop.duration_minutes,
+                },
+            )
+        durations.append(duration)
+
+    # -- One consistent snapshot for points, rules and reservations ----------
+    with db.conn() as connection:
+        previous_level = connection.isolation_level
+        connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        try:
+            with connection.transaction():
+                cur = connection.cursor()
+                plan_inputs: list[StopPlanInput] = []
+                for index, stop in enumerate(body.stops):
+                    try:
+                        point, rules_row = db.get_current_rules(cur, stop.point_id)
+                    except NotFoundError as exc:
+                        raise _stop_scoped(exc, index, stop.point_id)
+                    except ApiError as exc:
+                        # no_published_version: preserve the code, tag the stop.
+                        raise _stop_scoped(exc, index, stop.point_id)
+                    zone = get_zone(point["timezone"])
+                    ruleset = payload_to_ruleset(rules_row["payload"])
+                    # Expand a little wider than the search window so
+                    # overnight sessions spilling over a range edge still
+                    # surface as one continuous interval.
+                    date_from = (
+                        search_start - timedelta(days=2)
+                    ).astimezone(zone).date()
+                    date_to = (
+                        search_end + timedelta(days=2)
+                    ).astimezone(zone).date()
+                    intervals = tuple(
+                        build_open_intervals(
+                            point["timezone"], ruleset, date_from, date_to
+                        )
+                    )
+                    # Non-cancelled reservations that can forbid any start
+                    # whose window could reach the search range.
+                    reservation_rows = cur.execute(
+                        "SELECT start_utc, end_utc FROM reservations "
+                        "WHERE point_id = %s AND status = 'active' "
+                        "AND start_utc < %s AND end_utc > %s",
+                        (
+                            stop.point_id,
+                            search_end + max_duration,
+                            search_start - max_duration,
+                        ),
+                    ).fetchall()
+                    reservations = tuple(
+                        (row["start_utc"], row["end_utc"])
+                        for row in reservation_rows
+                    )
+                    plan_inputs.append(
+                        StopPlanInput(
+                            point_id=stop.point_id,
+                            duration=durations[index],
+                            rules_version=rules_row["version"],
+                            capacity=point["capacity"],
+                            open_intervals=intervals,
+                            reservations=reservations,
+                        )
+                    )
+        finally:
+            connection.isolation_level = previous_level
+
+    # -- Pure greedy planner on the frozen snapshot --------------------------
+    planned = plan_earliest_trip(
+        plan_inputs,
+        search_start=search_start,
+        search_end=search_end,
+        min_gap=timedelta(minutes=body.min_gap_minutes),
+        now=now,
+        max_days_ahead=settings.reservation_max_days_ahead,
+    )
+
+    trip_out = (
+        [
+            TripSearchStopOut(
+                point_id=item.point_id,
+                start=utc_iso(item.start),
+                end=utc_iso(item.end),
+                rules_version=item.rules_version,
+            )
+            for item in planned
+        ]
+        if planned is not None
+        else None
+    )
+    return TripSearchOut(
+        trip=trip_out,
+        min_gap_minutes=body.min_gap_minutes,
+        search_start=utc_iso(search_start),
+        search_end=utc_iso(search_end),
+        horizon_start=utc_iso(now),
+        horizon_end=utc_iso(horizon_end),
+    )

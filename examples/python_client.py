@@ -102,6 +102,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
     weekday = tomorrow.isoweekday()
+    day_after_tomorrow = tomorrow + timedelta(days=1)
 
     status, utc_point = call(
         "POST", "/points", {"name": "预约演示点", "timezone": "UTC"}
@@ -567,6 +568,104 @@ def main() -> None:
         status,
         after_cancel,
     )
+
+    # ------------------------------------------------------------------
+    # Trip availability search (行程可行性搜索): read-only, books nothing.
+    # Two fresh points with full-day openings make the result predictable.
+    # ------------------------------------------------------------------
+    search_points = []
+    for letter, hours in (("A", ("08:00", "18:00")), ("B", ("09:00", "17:00"))):
+        status, sp = call(
+            "POST", "/points", {"name": f"行程搜索点{letter}", "timezone": "UTC"}
+        )
+        spid = sp["id"]
+        call(
+            "POST",
+            f"/points/{spid}/rules",
+            {
+                "expected_version": 0,
+                "rules": {
+                    "weekly": [
+                        {"weekday": weekday, "start_time": hours[0], "end_time": hours[1]}
+                    ],
+                    "closed_dates": [],
+                    "makeup": [],
+                },
+            },
+        )
+        search_points.append(spid)
+
+    status, found = call(
+        "POST",
+        "/trips/search",
+        {
+            # 2..5 distinct points in visit order; stay minutes per stop;
+            # minimum minutes between the previous end and the next start;
+            # timezone-aware bracket for the whole group (span <= 7 days).
+            "stops": [
+                {"point_id": search_points[0], "duration_minutes": 45},
+                {"point_id": search_points[1], "duration_minutes": 30},
+            ],
+            "min_gap_minutes": 30,
+            "search_start": f"{tomorrow}T00:00:00Z",
+            "search_end": f"{tomorrow}T23:59:00Z",
+        },
+    )
+    show(
+        "earliest feasible itinerary (read-only; no reservation is created)",
+        status,
+        found,
+    )
+    # The planned windows are directly submittable to POST /trips:
+    if found.get("trip"):
+        status, searched_booking = call(
+            "POST",
+            "/trips",
+            {
+                "idempotency_key": f"search-then-book-{search_points[0]}",
+                "stops": [
+                    {
+                        "point_id": s["point_id"],
+                        "start": s["start"],
+                        "end": s["end"],
+                    }
+                    for s in found["trip"]
+                ],
+            },
+        )
+        show("the search result books successfully as a real trip", status, searched_booking)
+
+    # No feasible itinerary -> trip is null (here both points are closed on
+    # the following day):
+    status, empty = call(
+        "POST",
+        "/trips/search",
+        {
+            "stops": [
+                {"point_id": search_points[0], "duration_minutes": 30},
+                {"point_id": search_points[1], "duration_minutes": 30},
+            ],
+            "min_gap_minutes": 0,
+            "search_start": f"{day_after_tomorrow}T00:00:00Z",
+            "search_end": f"{day_after_tomorrow}T23:59:00Z",
+        },
+    )
+    show("no feasible itinerary on a closed day -> trip: null", status, empty)
+
+    # Per-stop errors name the failing stop (stop_index + point_id).
+    status, bad_search = call(
+        "POST",
+        "/trips/search",
+        {
+            "stops": [
+                {"point_id": search_points[0], "duration_minutes": 30},
+                {"point_id": 999999, "duration_minutes": 30},
+            ],
+            "search_start": f"{tomorrow}T00:00:00Z",
+            "search_end": f"{tomorrow}T23:59:00Z",
+        },
+    )
+    show("missing point at stop 1 -> 404 point_not_found", status, bad_search)
 
     # ------------------------------------------------------------------
     # Capacity (同时接待名额): 1..20 concurrent slots per point, default 1.

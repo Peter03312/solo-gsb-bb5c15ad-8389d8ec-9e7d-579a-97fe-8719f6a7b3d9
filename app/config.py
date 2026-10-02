@@ -14,6 +14,7 @@ class Settings:
     max_query_days: int
     reservation_max_days_ahead: int
     reservation_max_duration_minutes: int
+    trip_search_max_days: int
 
     @staticmethod
     def load() -> "Settings":
@@ -36,6 +37,7 @@ class Settings:
             reservation_max_duration_minutes=int(
                 os.getenv("RESERVATION_MAX_DURATION_MINUTES", "120")
             ),
+            trip_search_max_days=int(os.getenv("TRIP_SEARCH_MAX_DAYS", "7")),
         )
 
 
